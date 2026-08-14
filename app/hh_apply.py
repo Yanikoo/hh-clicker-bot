@@ -1,0 +1,734 @@
+"""
+HH.ru apply functions: send response, fill questionnaire, check vacancy, check limit, touch resume.
+"""
+
+import re
+import json
+import time
+import requests
+import aiohttp
+
+from glom import glom
+
+from app.logging_utils import log_debug, _is_login_page
+from app.config import CONFIG, hh_base
+from app.hh_http import HH
+from app.hh_api import get_headers
+from app.oauth import _oauth_touch_resume
+from app.questionnaire import _parse_questionnaire_fields, _parse_questionnaire_rich
+from app.llm import _randomize_text, generate_llm_questionnaire_answers, get_llm_last_status
+from app.hh_resume import fetch_resume_text
+
+_HH_DEFAULT_TIMEOUT = 15
+
+
+def _parse_retry_after(value: str) -> int | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value)
+        return max(0, int(dt.timestamp() - time.time()))
+    except Exception:
+        return None
+
+
+def _with_retry(func, retries=3, backoff_base=2.0):
+    def wrapper(*args, **kwargs):
+        for attempt in range(retries + 1):
+            try:
+                resp = func(*args, **kwargs)
+                if hasattr(resp, "status_code") and resp.status_code in (502, 503, 504):
+                    if attempt == retries:
+                        return resp
+                    sleep = backoff_base * (2 ** attempt)
+                    log_debug(f"_with_retry {getattr(func, '__name__', 'unknown')}: HTTP {resp.status_code}, sleep {sleep}s ({attempt+1}/{retries+1})")
+                    time.sleep(sleep)
+                    continue
+                return resp
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt == retries:
+                    raise
+                sleep = backoff_base * (2 ** attempt)
+                log_debug(f"_with_retry {getattr(func, '__name__', 'unknown')}: {type(e).__name__}, sleep {sleep}s ({attempt+1}/{retries+1})")
+                time.sleep(sleep)
+        return func(*args, **kwargs)
+    wrapper.__name__ = getattr(func, "__name__", "unknown")
+    return wrapper
+
+
+def classify_apply_response(status_code: int, txt: str) -> tuple:
+    """Pure: классифицирует ответ HH popup на отклик в (result, info).
+    Вынесено из send_response_async чтобы было тестируемо без mock'ов HTTP.
+
+    Порядок проверок важен:
+    1. 401/403 → auth_error
+    2. 200 + login-page HTML → auth_error
+    3. известные error-маркеры в теле (limit/test/already) — даже на 200, т.к. HH
+       отдаёт их с status=200 (см. audit C5)
+    4. 200 + success-маркер → sent
+    5. всё остальное → error
+    """
+    if status_code in (401, 403):
+        return "auth_error", {}
+
+    if status_code == 200 and _is_login_page(txt):
+        return "auth_error", {}
+
+    info = {}
+    parsed = None
+    if txt.startswith("{"):
+        try:
+            parsed = json.loads(txt)
+        except Exception:
+            parsed = None
+
+    if parsed is not None:
+        # info из responseStatus.shortVacancy (старый формат popup)
+        info = {
+            "title": glom(parsed, "responseStatus.shortVacancy.name", default="") or "",
+            "company": glom(parsed, "responseStatus.shortVacancy.company.name", default="") or "",
+            "salary_from": glom(parsed, "responseStatus.shortVacancy.compensation.from", default=None),
+            "salary_to": glom(parsed, "responseStatus.shortVacancy.compensation.to", default=None),
+        }
+        ci = glom(parsed, "responseStatus.shortVacancy.contactInfo", default={}) or {}
+        if ci and (ci.get("email") or ci.get("fio")):
+            contact = {"fio": ci.get("fio", ""), "email": ci.get("email", ""), "phone": ""}
+            phones = (ci.get("phones") or {}).get("phones", [])
+            if phones:
+                ph = phones[0]
+                contact["phone"] = f"+{ph.get('country','')}{ph.get('city','')}{ph.get('number','')}"
+            info["contact"] = contact
+
+        # Сначала отказы (test/limit/already) — они могут сосуществовать с
+        # success-маркером в нестандартных ответах, и приоритет должен быть у отказа.
+
+        # top-level "error":"..." (HTTP 400 формат)
+        top_error = parsed.get("error")
+        if top_error:
+            ts = str(top_error).lower()
+            if "test-required" in ts or "test_required" in ts:
+                return "test", info
+            if "limit" in ts or "negotiations-limit" in ts:
+                return "limit", info
+            if "already" in ts:
+                return "already", info
+            return "error", {"raw": txt[:300], **info, "error_code": str(top_error)}
+
+        # Старый формат: responseStatus.*
+        rs = parsed.get("responseStatus") or {}
+        if rs.get("alreadyApplied") is True:
+            return "already", info
+        if rs.get("test-required") is True or rs.get("testRequired") is True:
+            return "test", info
+        if (rs.get("negotiationsLimitExceeded") is True
+                or rs.get("negotiations-limit-exceeded") is True):
+            return "limit", info
+
+        # top-level отказы как поля рядом с success (защита от неоднозначных ответов)
+        if parsed.get("test-required") is True or parsed.get("testRequired") is True:
+            return "test", info
+        if parsed.get("alreadyApplied") is True:
+            return "already", info
+        if (parsed.get("negotiationsLimitExceeded") is True
+                or parsed.get("negotiations-limit-exceeded") is True):
+            return "limit", info
+
+        # Теперь успех: новый формат top-level success/topic_id
+        top_success = parsed.get("success")
+        if top_success in (True, "true", "True") or parsed.get("topic_id"):
+            info["topic_id"] = parsed.get("topic_id", "")
+            info["chat_id"] = parsed.get("chat_id", "")
+            return "sent", info
+        if rs.get("responded") is True or rs.get("success") is True:
+            return "sent", info
+        # JSON распарсен но никаких флагов — fallthrough к substring fallback.
+
+    # ── 3. Substring fallback для не-JSON ответов (HTML страница и т.п.) ──
+    if "negotiations-limit-exceeded" in txt:
+        return "limit", info
+    if "test-required" in txt:
+        return "test", info
+    if "alreadyApplied" in txt:
+        return "already", info
+
+    if status_code == 200:
+        if ('"success":true' in txt or '"success":"true"' in txt
+                or '"status":"ok"' in txt or '"responded":true' in txt
+                or "shortVacancy" in txt or "topic_id" in txt):
+            return "sent", info
+        # HH иногда отдаёт 200 + HTML SPA-страницу редиректа (например на
+        # /vacancy/{id} после успешного отклика) без JSON-маркеров. Если
+        # тело большое (>2KB HTML) и НЕ содержит явных ошибок — trust'им,
+        # 200 от popup submit без 4xx-error = отклик прошёл.
+        if len(txt) > 2000 and ("<!doctype" in txt[:200].lower() or "<html" in txt[:200].lower()):
+            if not any(m in txt for m in ('"error"', 'test-required', 'already-applied',
+                                          'negotiations-limit', 'SPAM_DETECTED', 'captcha')):
+                return "sent", info
+        return "error", {"raw": txt[:200], **info}
+
+    if status_code in (502, 503, 504):
+        return "error", {"raw": txt[:200], "transient": True, **info}
+
+    return "error", {"raw": txt[:200], **info}
+
+
+async def generate_hh_ai_letter(acc: dict, resume_hash: str, vid: str, timeout_s: int = 6) -> str:
+    """`POST /shards/hhpro_ai_letter {resumeHash, vacancyId}` — HH-Pro фича,
+    но сервер даёт по одной бесплатной попытке на пару (resumeHash, vacancyId)
+    независимо от подписки. Async: poll `/shards/hhpro_ai_check_status`.
+    Возвращает текст письма или "" если не сгенерилось / уже использовали.
+
+    Асинхронная целиком: `HH` — sync wrapper, гоним в thread-pool через
+    `asyncio.to_thread`; sleep — `asyncio.sleep`. Иначе последовательный
+    poll блокирует event loop и рушит `asyncio.gather` из send_response_async
+    (10 вакансий × 6с = 60с фризу цикла).
+    """
+    import asyncio as _asyncio
+    xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
+    if not xsrf or not resume_hash or not vid:
+        return ""
+    headers = get_headers(xsrf)
+    try:
+        r = await _asyncio.to_thread(
+            HH.post,
+            f"{hh_base()}/shards/hhpro_ai_letter",
+            headers={**headers, "Content-Type": "application/json"},
+            cookies=acc.get("cookies", {}),
+            json={"resumeHash": resume_hash, "vacancyId": str(vid)},
+            timeout=8,
+        )
+        if r.status_code == 400 and "service_already_used" in r.text.lower():
+            log_debug(f"hhpro_ai_letter {vid}: service_already_used — эту пару уже использовали, юзаем шаблон")
+            return ""
+        if r.status_code not in (200, 202):
+            log_debug(f"hhpro_ai_letter {vid}: HTTP {r.status_code}, body={r.text[:150]}")
+            return ""
+    except Exception as e:
+        log_debug(f"hhpro_ai_letter start {vid}: {e}")
+        return ""
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        await _asyncio.sleep(1)
+        try:
+            r = await _asyncio.to_thread(
+                HH.get,
+                f"{hh_base()}/shards/hhpro_ai_check_status",
+                params={"resumeHash": resume_hash, "vacancyId": str(vid)},
+                cookies=acc.get("cookies", {}),
+                headers=headers,
+                timeout=6,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            text = (data.get("generatedLetter") or data.get("letter")
+                    or data.get("text") or (data.get("result") or {}).get("text")
+                    or data.get("content") or "").strip()
+            status = (data.get("status") or "").lower()
+            if text:
+                return text
+            if status in ("ready", "done", "success") and not text:
+                log_debug(f"hhpro_ai_check_status {vid}: ready но текст пуст, ключи={list(data.keys())}")
+                return ""
+        except Exception:
+            continue
+    return ""
+
+
+async def send_response_async(acc: dict, vid: str, letter_max_length: int | None = None) -> tuple:
+    """Асинхронная отправка отклика. Возвращает (результат, инфо).
+    `letter_max_length` — hard-cap длины письма из vacancyView.applicantVacancyResponseStatuses;
+    если задан и превышает — режем чтобы HH не отказал 400.
+    Если `CONFIG.hh_ai_letter_first_try` включен и у нас ещё есть бесплатная попытка
+    (сервер даст 1 раз на пару resumeHash×vacancyId) — берём письмо от HH-AI.
+    """
+    log_debug(f"📤 ОТПРАВКА ОТКЛИКА на вакансию {vid} | Аккаунт: {acc['name']}")
+
+    xsrf = acc.get("cookies", {}).get("_xsrf", "")
+    if not xsrf:
+        return "error", {"exception": "Missing _xsrf token"}
+    headers = get_headers(xsrf)
+
+    letter = _randomize_text(acc.get("letter", ""))
+    try:
+        if getattr(CONFIG, "hh_ai_letter_first_try", True):
+            ai_letter = await generate_hh_ai_letter(acc, acc.get("resume_hash", ""), vid)
+            if ai_letter:
+                letter = ai_letter
+                log_debug(f"   AI-letter от HH: {len(letter)} симв, юзаю его вместо шаблона")
+    except Exception as e:
+        log_debug(f"   hhpro_ai_letter fail {vid}: {e}")
+    if letter_max_length and len(letter) > letter_max_length:
+        letter = letter[:letter_max_length].rstrip()
+
+    data = aiohttp.FormData()
+    data.add_field("resume_hash", acc["resume_hash"])
+    data.add_field("vacancy_id", vid)
+    data.add_field("letterRequired", "true")
+    data.add_field("letter", letter)
+    data.add_field("lux", "true")
+    data.add_field("ignore_postponed", "true")
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, cookies=acc["cookies"]) as session:
+            async with session.post(
+                hh_base() + "/applicant/vacancy_response/popup",
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=_HH_DEFAULT_TIMEOUT)
+            ) as r:
+                txt = await r.text()
+                status_code = r.status
+
+        log_debug(f"   Ответ HTTP: {status_code} | Размер: {len(txt)}")
+        if status_code >= 400:
+            log_debug(f"   Тело ответа: {txt[:300]}")
+        elif status_code == 200 and 500 < len(txt) < 30000 and '"topic_id"' not in txt and '"success"' not in txt:
+            # Диагностика: HTML-редирект после отклика — что там?
+            log_debug(f"   200 (не-JSON, {len(txt)}b): {txt[:200]}")
+        return classify_apply_response(status_code, txt)
+    except Exception as e:
+        return "error", {"exception": str(e)}
+
+
+async def fill_and_submit_questionnaire(acc: dict, vid: str,
+                                        vacancy_title: str = "", company: str = "") -> tuple:
+    """
+    Получает страницу опроса, заполняет шаблонными ответами и отправляет.
+    Поддерживает textarea, radio, checkbox.
+    Возвращает (result, info): result = sent | limit | test | error
+    """
+    headers_get = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": f"{hh_base()}/vacancy/{vid}",
+    }
+
+    try:
+        async with aiohttp.ClientSession(
+            cookies=acc["cookies"],
+            headers=headers_get
+        ) as session:
+            url_form = f"{hh_base()}/applicant/vacancy_response?vacancyId={vid}&withoutTest=no"
+
+            # Шаг 1: GET форма опроса
+            async with session.get(url_form, timeout=aiohttp.ClientTimeout(total=_HH_DEFAULT_TIMEOUT)) as r:
+                html = await r.text()
+                status_code = r.status
+
+            # Auth check: 401/403/login-page → не считать "test" (валидный отклик),
+            # а отдать auth_error чтобы воркер обновил куки/спаузил аккаунт.
+            if status_code in (401, 403) or _is_login_page(html):
+                return "auth_error", {}
+            if status_code != 200:
+                return "error", {"http_status": status_code}
+
+            # Hidden поля
+            hidden = dict(re.findall(r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"', html))
+            hidden.update(dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]+type="hidden"[^>]+value="([^"]*)"', html)))
+
+            # Парсим все поля опроса
+            questions, field_answers = _parse_questionnaire_fields(html)
+
+            if not field_answers:
+                log_debug(f"Questionnaire: no task fields found for {vid}")
+                return "test", {}
+
+            # LLM-заполнение опросника (если включено)
+            if CONFIG.llm_fill_questionnaire and CONFIG.llm_enabled and questions:
+                rich_qs = _parse_questionnaire_rich(html)
+                resume_text = ""
+                if CONFIG.llm_use_resume:
+                    # fetch_resume_text — sync requests.get с 15s timeout.
+                    # В async-функции блокирует event loop → выносим в executor.
+                    import asyncio as _aio
+                    resume_text = await _aio.get_event_loop().run_in_executor(None, fetch_resume_text, acc)
+                # generate_llm_questionnaire_answers тоже sync (OpenAI client).
+                import asyncio as _aio2
+                llm_ans = await _aio2.get_event_loop().run_in_executor(
+                    None,
+                    lambda: generate_llm_questionnaire_answers(
+                        rich_qs, vacancy_title, company, resume_text=resume_text, account_key=f"questionnaire:{vid}"
+                    ),
+                )
+                if llm_ans:
+                    # Validate LLM answers against actual options
+                    rich_fields = {q["field"]: q for q in rich_qs}
+                    validated_ans = {}
+                    for field, llm_val in llm_ans.items():
+                        if field not in rich_fields:
+                            # Free-text or unknown field — only accept scalars
+                            if isinstance(llm_val, (str, int, float, bool)):
+                                validated_ans[field] = str(llm_val)
+                            continue
+                        q = rich_fields[field]
+                        if not (q["type"] in ("radio", "checkbox", "select") and q["options"]):
+                            if isinstance(llm_val, (str, int, float, bool)):
+                                validated_ans[field] = str(llm_val)
+                            continue
+                        valid_values = [o["value"] for o in q["options"]]
+                        # Checkbox may legitimately receive a list of selected values
+                        if q["type"] == "checkbox" and isinstance(llm_val, list):
+                            picked = []
+                            for item in llm_val:
+                                if not isinstance(item, (str, int, float, bool)):
+                                    continue
+                                s = str(item).strip()
+                                if s in valid_values:
+                                    picked.append(s)
+                                else:
+                                    fuzzy = [v for v in valid_values if v.lower().strip() == s.lower()]
+                                    if fuzzy:
+                                        picked.append(fuzzy[0])
+                            if picked:
+                                validated_ans[field] = picked
+                            else:
+                                log_debug(f"LLM checkbox {field}: nothing matched in {llm_val} vs {valid_values}")
+                            continue
+                        # Scalar option (radio/select or single checkbox value as string)
+                        if not isinstance(llm_val, (str, int, float, bool)):
+                            log_debug(f"LLM {q['type']} {field}: unexpected type {type(llm_val).__name__}, skipping")
+                            continue
+                        s = str(llm_val).strip()
+                        if s in valid_values:
+                            validated_ans[field] = s
+                        else:
+                            fuzzy = [v for v in valid_values if v.lower().strip() == s.lower()]
+                            if fuzzy:
+                                validated_ans[field] = fuzzy[0]
+                            else:
+                                log_debug(f"LLM answer '{s}' not in options {valid_values}, skipping field {field}")
+                    overridden = [f for f in validated_ans if f in field_answers]
+                    for f in overridden:
+                        field_answers[f] = validated_ans[f]
+                    log_debug(f"Questionnaire {vid}: LLM заполнил {len(overridden)}/{len(field_answers)} полей: {overridden}")
+                else:
+                    llm_status = get_llm_last_status(f"questionnaire:{vid}", "questionnaire")
+                    provider = llm_status.get("provider") or "unknown"
+                    status = llm_status.get("status") or "empty"
+                    if provider == "openclaw" and status == "timeout":
+                        log_debug(f"Questionnaire {vid}: OpenClaw timeout, используем шаблоны")
+                    else:
+                        log_debug(
+                            f"Questionnaire {vid}: LLM не дал валидный ответ "
+                            f"(provider={provider}, status={status}), используем шаблоны"
+                        )
+
+            log_debug(f"Questionnaire {vid}: {len(field_answers)} fields, {len(questions)} questions")
+            for name, val in field_answers.items():
+                log_debug(f"  {name} = {str(val)[:80]}")
+
+            # Шаг 2: POST данные
+            data = aiohttp.FormData()
+            data.add_field("resume_hash", acc["resume_hash"])
+            data.add_field("vacancy_id", vid)
+            data.add_field("letter", _randomize_text(acc.get("letter", "")))
+            data.add_field("lux", "true")
+
+            for name in ("_xsrf", "uidPk", "guid", "startTime", "testRequired"):
+                if name in hidden:
+                    data.add_field(name, hidden[name])
+
+            for name, value in field_answers.items():
+                # checkbox с несколькими выбранными значениями → несколько полей одного name
+                if isinstance(value, list):
+                    for v in value:
+                        data.add_field(name, str(v))
+                else:
+                    data.add_field(name, str(value))
+
+            # Шаг 3: POST
+            async with session.post(
+                url_form,
+                headers={"X-Xsrftoken": acc.get("cookies", {}).get("_xsrf", ""), "Referer": url_form},
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=_HH_DEFAULT_TIMEOUT),
+                allow_redirects=False,
+            ) as r2:
+                status = r2.status
+                location = r2.headers.get("location", "")
+                txt = await r2.text()
+
+            log_debug(f"Questionnaire submit {vid}: HTTP {status} location={location}")
+
+            if status in (302, 303):
+                if "negotiations-limit-exceeded" in location or "negotiations-limit-exceeded" in txt:
+                    return "limit", {}
+                # Редирект назад на форму — ошибка валидации
+                if "withoutTest=no" in location or f"vacancyId={vid}" in location:
+                    log_debug(f"Questionnaire {vid}: form rejected, redirect back")
+                    return "test", {}
+                return "sent", {}
+
+            if status == 200:
+                if "negotiations-limit-exceeded" in txt:
+                    return "limit", {}
+                if "test-required" in txt:
+                    return "test", {}
+                return "sent", {}
+
+            return "test", {}
+
+    except Exception as e:
+        log_debug(f"fill_and_submit_questionnaire error: {e}")
+        return "error", {"exception": str(e)}
+
+
+def _check_vacancy_before_apply(acc: dict, vid: str) -> dict:
+    """Pre-check vacancy before applying: detect impossible responses and experience mismatches.
+    Returns {"ok": bool, "reason": str}
+    """
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    try:
+        r = _with_retry(
+            lambda: HH.get(
+                f"{hh_base()}/applicant/vacancy_response/popup?vacancyId={vid}",
+                headers={"User-Agent": ua, "Accept": "application/json, */*",
+                         "Referer": f"{hh_base()}/vacancy/{vid}"},
+                cookies=acc.get("cookies", {}),
+                timeout=_HH_DEFAULT_TIMEOUT,
+            ),
+            retries=3, backoff_base=2.0,
+        )()
+        if r.status_code in (401, 403) or _is_login_page(r.text):
+            return {"ok": False, "reason": "auth_error", "skip_reason": "auth"}
+        if r.status_code == 429:
+            retry_after = _parse_retry_after(r.headers.get("Retry-After", ""))
+            result = {"ok": False, "reason": "rate_limit", "skip_reason": "retry"}
+            if retry_after is not None:
+                result["retry_after_seconds"] = retry_after
+            return result
+        if r.status_code >= 500:
+            # HH server issue — попробовать позже.
+            return {"ok": False, "reason": f"http_{r.status_code}", "skip_reason": "retry"}
+        if r.status_code != 200:
+            # 4xx (другие, кроме 401/403/429) — permanent skip.
+            return {"ok": False, "reason": f"http_{r.status_code}", "skip_reason": "skip"}
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError):
+            return {"ok": False, "reason": "bad_json", "skip_reason": "parse_error"}
+        # Check responseImpossible
+        resp_status = data.get("responseStatus") or {}
+        if resp_status.get("responseImpossible"):
+            reason = resp_status.get("responseImpossibleReason", "responseImpossible")
+            return {"ok": False, "reason": str(reason)}
+        # Check resume inconsistencies (experience type mismatch)
+        body = data.get("body", {})
+        inner_rs = body.get("responseStatus", resp_status)
+        incon_data = inner_rs.get("resumeInconsistencies", resp_status.get("resumeInconsistencies", {}))
+        if isinstance(incon_data, dict):
+            for resume_entry in incon_data.get("resume", []):
+                for inc in (resume_entry.get("inconsistencies", {}).get("inconsistency", [])):
+                    if inc.get("type") == "EXPERIENCE":
+                        return {"ok": False, "reason": f"опыт: нужен {inc.get('required','?')}, есть {inc.get('actual','?')}"}
+        elif isinstance(incon_data, list):
+            for inc in incon_data:
+                if isinstance(inc, dict) and inc.get("type") == "EXPERIENCE":
+                    return {"ok": False, "reason": f"несовпадение опыта"}
+
+        # Extract contactInfo if available
+        contact = {}
+        sv = inner_rs.get("shortVacancy", {})
+        ci = sv.get("contactInfo", {})
+        if ci and (ci.get("email") or ci.get("fio")):
+            contact = {
+                "fio": ci.get("fio", ""),
+                "email": ci.get("email", ""),
+                "phone": "",
+            }
+            phones = ci.get("phones", {}).get("phones", [])
+            if phones:
+                p = phones[0]
+                contact["phone"] = f"+{p.get('country','')}{p.get('city','')}{p.get('number','')}"
+
+        # applicantVacancyResponseStatuses{vid} — test.required / letterMaxLength;
+        # aiAssistantInfo — HR подключил ML-скрининг откликов.
+        avrs = ((body.get("vacancyView") or {}).get("applicantVacancyResponseStatuses")
+                or data.get("applicantVacancyResponseStatuses") or {})
+        vac_status = avrs.get(str(vid), {}) if isinstance(avrs, dict) else {}
+        letter_max = vac_status.get("letterMaxLength")
+        test_info = vac_status.get("test") or {}
+        ai_info = ((body.get("vacancyView") or {}).get("aiAssistantInfo")
+                   or data.get("aiAssistantInfo") or {})
+        extras = {
+            "letter_max_length": int(letter_max) if isinstance(letter_max, (int, str)) and str(letter_max).isdigit() else None,
+            "test_required": bool(test_info.get("required")) if test_info else False,
+            "ai_assistant_enabled": bool(ai_info.get("isCurrentlyEnabled")),
+        }
+
+        return {"ok": True, "reason": "", "contact": contact, "extras": extras}
+    except Exception as e:
+        log_debug(f"_check_vacancy_before_apply {vid}: {e}")
+        # Fail-closed: на любой неожиданной ошибке лучше пропустить вакансию,
+        # чем зря потратить лимит откликов.
+        return {"ok": False, "reason": str(e), "skip_reason": "exception"}
+
+
+def check_limit(acc: dict) -> bool:
+    """True если лимит активен. Uses GET popup (no side effects)."""
+    # GET popup — safe, no side effects, no wasted apply slots
+    xsrf = acc.get("cookies", {}).get("_xsrf", "")
+    if not xsrf:
+        return True
+    try:
+        r_search = _with_retry(
+            lambda: HH.get(
+                hh_base() + "/search/vacancy?text=&area=1&page=0",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                         "Accept": "text/html"},
+                cookies=acc["cookies"], timeout=_HH_DEFAULT_TIMEOUT,
+            ),
+            retries=3, backoff_base=2.0,
+        )()
+        vids = re.findall(r'/vacancy/(\d+)', r_search.text)
+        if not vids:
+            return True
+        vid = vids[0]
+        # Use GET popup — safe, no side effects
+        r = _with_retry(
+            lambda: HH.get(
+                f"{hh_base()}/applicant/vacancy_response/popup?vacancyId={vid}",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                         "Accept": "application/json", "X-Xsrftoken": xsrf},
+                cookies=acc["cookies"], timeout=_HH_DEFAULT_TIMEOUT,
+            ),
+            retries=3, backoff_base=2.0,
+        )()
+        return "negotiations-limit-exceeded" in r.text
+    except Exception:
+        return True
+
+
+def touch_resume(acc: dict) -> tuple:
+    """
+    Поднять резюме в поиске.
+    Порядок попыток:
+      1. OAuth — не требует капчи, но иногда 429.
+      2. `POST /shards/resume/batch_update` — обновляет все резюме аккаунта одним
+         вызовом, без fingerprint, без капчи. Если пройдёт — бесплатный boost.
+      3. `POST /applicant/resumes/touch` — старый путь, может отдать капчу.
+    Возвращает (success: bool, message: str)
+    """
+    ok, msg = _oauth_touch_resume(acc)
+    if ok:
+        return True, msg
+    if "429" not in msg:
+        log_debug(f"touch_resume OAuth failed: {msg}, пробую batch_update")
+
+    xsrf = acc.get("cookies", {}).get("_xsrf", "")
+    if not xsrf:
+        return False, msg or "Missing _xsrf token"
+    headers = get_headers(xsrf)
+
+    try:
+        r = HH.post(
+            hh_base() + "/shards/resume/batch_update",
+            headers=headers,
+            cookies=acc["cookies"],
+            timeout=_HH_DEFAULT_TIMEOUT,
+        )
+        if r.status_code == 200:
+            captcha_flag = False
+            try:
+                _bd = r.json()
+                captcha_flag = bool(
+                    (_bd.get("hhcaptcha") or {}).get("isBot")
+                    or (_bd.get("recaptcha") or {}).get("isBot")
+                )
+            except Exception:
+                captcha_flag = '"isbot":true' in (r.text or "").lower().replace(" ", "")
+            if captcha_flag:
+                log_debug("batch_update: сервер отдал hhcaptcha/recaptcha isBot=true")
+            else:
+                return True, "Резюме подняты (batch_update)"
+        elif r.status_code == 429:
+            return False, "Слишком часто (429)"
+        else:
+            log_debug(f"batch_update HTTP {r.status_code}, пробую /applicant/resumes/touch")
+    except Exception as e:
+        log_debug(f"batch_update exception: {e}, пробую /applicant/resumes/touch")
+
+    resume_hash = acc["resume_hash"]
+    touch_files = {
+        "resume": (None, resume_hash),
+        "undirectable": (None, "true"),
+    }
+    try:
+        response = _with_retry(
+            lambda: HH.post(
+                hh_base() + "/applicant/resumes/touch",
+                headers=headers,
+                cookies=acc["cookies"],
+                files=touch_files,
+                timeout=_HH_DEFAULT_TIMEOUT,
+            ),
+            retries=3, backoff_base=2.0,
+        )()
+
+        if response.status_code == 200:
+            return True, "Резюме поднято (web)!"
+        elif response.status_code == 429:
+            return False, "Слишком часто (429)"
+        else:
+            return False, msg or f"HTTP {response.status_code}"
+
+    except Exception as e:
+        return False, msg or f"Ошибка: {str(e)[:30]}"
+
+
+def fetch_related_vacancies(acc: dict, seed_vid: str, max_pages: int = 1) -> list:
+    """`GET /shards/vacancy/related_vacancies?vacancyId=X&SourceLabel=suitable_vacancies`
+    — рекомендательный фид HH: подбирает похожие вакансии под seed по своему
+    ML-ranker'у. Обычно лучше match'ит чем текстовый поиск.
+    Возвращает уникальный список vacancy_id (строки).
+    """
+    if not seed_vid:
+        return []
+    xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
+    headers = get_headers(xsrf) if xsrf else {}
+    # X-Proxied-* обязательны для /shards/* endpoint'ов чтобы сервер не отказал 4xx.
+    headers.update({
+        "X-Proxied-Hhtm-Source": "vacancy",
+        "X-Proxied-Page-Name": "vacancy",
+        "X-Proxied-Place": "related_vacancies",
+        "X-Proxied-Type": "Component",
+        "X-Use-SSR": "False",
+        "X-Is-SPA": "true",
+        "Accept": "application/json",
+    })
+    out = []
+    seen = set()
+    for page in range(1, max_pages + 1):
+        try:
+            r = HH.get(
+                f"{hh_base()}/shards/vacancy/related_vacancies",
+                params={
+                    "vacancyId": str(seed_vid),
+                    "page": page,
+                    "SourceLabel": "suitable_vacancies",
+                },
+                headers=headers,
+                cookies=acc.get("cookies", {}),
+                timeout=8,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            items = data.get("vacancies") or data.get("items") or []
+            for it in items:
+                vid = str((it or {}).get("vacancyId") or (it or {}).get("id") or "")
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    out.append(vid)
+            total = data.get("totalPages") or 1
+            if page >= total:
+                break
+        except Exception as e:
+            log_debug(f"fetch_related_vacancies seed={seed_vid} p={page}: {e}")
+            break
+    return out

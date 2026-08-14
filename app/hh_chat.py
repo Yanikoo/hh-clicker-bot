@@ -1,0 +1,719 @@
+"""
+HH.ru chat functions: fetch chat list, build threads, send messages, mark read.
+"""
+
+import os
+import requests
+from app.config import hh_base
+from app.hh_http import HH
+
+from app.logging_utils import log_debug, _is_login_page
+
+# Allowlist для HH_CHATIK_BASE: env injection (`HH_CHATIK_BASE=evil.com`)
+# не должен утечь куки/_xsrf на attacker domain (kimi-search-3 #7).
+_CHATIK_ALLOWED_BASES = frozenset({
+    "https://chatik.hh.ru",
+    "https://chatik.hh.kz",  # KZ зеркало
+})
+
+
+def _validated_chatik_base() -> str:
+    val = os.environ.get("HH_CHATIK_BASE", "https://chatik.hh.ru").strip().rstrip("/")
+    if val not in _CHATIK_ALLOWED_BASES:
+        log_debug(f"HH_CHATIK_BASE={val!r} not in allowlist — falling back to default")
+        return "https://chatik.hh.ru"
+    return val
+
+
+_CHATIK_BASE = _validated_chatik_base()
+# Известные имена cookies от chatik — больше не пропускаем всё подряд
+# (kimi-search-3 #7: defense-in-depth против injection в chatik response).
+_CHATIK_COOKIE_WHITELIST = frozenset({"hhuid", "crypted_hhuid", "hhrole", "GMT"})
+
+
+def _ensure_chatik_cookies(acc: dict) -> None:
+    """Fetch hhuid/crypted_hhuid from hh.ru if missing, storing them in acc['cookies'] in-place.
+
+    Сериализовано через acc.get('_cookies_lock') если AccountState прокинул его в acc —
+    иначе несколько workers одного аккаунта (apply+stats+LLM) могут одновременно
+    перепрошивать куки и затирать друг друга → 401 (swarm-1 #8).
+    """
+    if acc["cookies"].get("hhuid"):
+        return
+    lock = acc.get("_cookies_lock")
+    if lock is not None:
+        # double-checked locking — пока ждали лок, другой воркер мог уже выставить
+        if not lock.acquire(timeout=10):
+            return
+        try:
+            if acc["cookies"].get("hhuid"):
+                return
+            _do_fetch_chatik_cookies(acc)
+        finally:
+            lock.release()
+    else:
+        _do_fetch_chatik_cookies(acc)
+
+
+def _do_fetch_chatik_cookies(acc: dict) -> None:
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    try:
+        r = HH.get(
+            hh_base() + "/",
+            cookies=acc["cookies"],
+            headers={"User-Agent": ua},
+            timeout=10,
+            allow_redirects=True,
+        )
+        for cookie in r.cookies:
+            # Whitelist: не пускаем произвольные cookies из ответа HH в acc
+            # (kimi-search-3 #7: blind cookie injection vector).
+            if cookie.name not in _CHATIK_COOKIE_WHITELIST:
+                continue
+            if cookie.value and cookie.name not in acc["cookies"]:
+                acc["cookies"][cookie.name] = cookie.value
+                log_debug(f"_ensure_chatik_cookies: got {cookie.name} for {acc.get('name', '?')}")
+    except Exception as e:
+        log_debug(f"_ensure_chatik_cookies error: {e}")
+
+
+def _fetch_chat_list(acc: dict, max_pages: int = 5) -> tuple:
+    """Fetch paginated chat list from chatik.hh.ru/chatik/api/chats.
+    Returns (items_by_id, display_info, current_participant_id).
+    items_by_id: {str(item_id): item_dict}
+    """
+    _ensure_chatik_cookies(acc)
+    xsrf = acc.get("cookies", {}).get("_xsrf", "")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, */*",
+        "Origin": _CHATIK_BASE,
+        "Referer": f"{_CHATIK_BASE}/",
+        "X-XSRFToken": xsrf,
+    }
+    items_by_id: dict = {}
+    display_info: dict = {}
+    current_participant_id: str = ""
+    cursor = ""
+
+    for page_num in range(max_pages):
+        if cursor:
+            url = f"{_CHATIK_BASE}/chatik/api/chats?cursor={cursor}"
+        else:
+            url = f"{_CHATIK_BASE}/chatik/api/chats?page={page_num}"
+        try:
+            resp = HH.get(url, cookies=acc["cookies"], headers=headers, timeout=15)
+            if resp.status_code in (401, 403) or _is_login_page(resp.text):
+                break
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception as e:
+            log_debug(f"_fetch_chat_list error: {e}")
+            break
+
+        chats_obj = data.get("chats", {})
+        items = chats_obj.get("items", [])
+        display_info.update(data.get("chatsDisplayInfo", {}))
+
+        for item in items:
+            item_id = str(item.get("id", ""))
+            if item_id:
+                items_by_id[item_id] = item
+            if not current_participant_id:
+                current_participant_id = item.get("currentParticipantId", "")
+
+        # Pagination: API signals take precedence over heuristics
+        if chats_obj.get("hasNextPage") is False:
+            break
+        next_cursor = chats_obj.get("nextPage")
+        if isinstance(next_cursor, str) and next_cursor:
+            cursor = next_cursor
+            continue
+        per_page = chats_obj.get("perPage", 20)
+        if len(items) < per_page:
+            break
+
+    return items_by_id, display_info, current_participant_id
+
+
+# Phrases that indicate chat messaging is disabled (employer locked or invite-only)
+_LOCKED_CHAT_PHRASES = (
+    "работодатель отключил переписку",
+    "переписка будет доступна после приглашения",
+)
+
+def _check_chat_locked(item: dict) -> str:
+    """Return lock reason string if chat has messaging disabled, else empty string."""
+    # Primary: API booleans and state
+    if item.get("canSendMessage") is False:
+        return "canSendMessage=false"
+    state = str(item.get("state") or item.get("chatState") or "").lower()
+    # Whitelist active states; всё неизвестное → считаем locked
+    # (fail-closed на новых HH chat-state markers, r12-3 #6).
+    _ACTIVE_CHAT_STATES = ("", "active", "open", "ok", "pending", "negotiation", "interview")
+    if state and state not in _ACTIVE_CHAT_STATES:
+        return f"state={state}"
+    if item.get("locked") is True:
+        return "locked=true"
+    # Fallback: phrase scan in last message text
+    last_msg = item.get("lastMessage") or {}
+    last_text = (last_msg.get("text") or "").lower()
+    for phrase in _LOCKED_CHAT_PHRASES:
+        if phrase in last_text:
+            return last_text[:80]
+    return ""
+
+
+def _build_thread_from_chat_item(item: dict, display_info: dict, cur_pid: str, neg_id: str) -> dict:
+    """Build a thread result dict from a /chat/messages item."""
+    result = {"neg_id": neg_id, "employer_name": "Работодатель", "vacancy_title": "",
+              "messages": [], "needs_reply": False, "last_msg_id": "", "last_employer_msg": "",
+              "topic_id": "", "error": "", "chat_locked": ""}
+
+    info = display_info.get(str(neg_id), display_info.get(str(item.get("id", "")), {}))
+    result["employer_name"] = (info.get("subtitle") or "Работодатель").strip(" ,")
+    result["vacancy_title"] = (info.get("title") or "").strip()
+
+    last_msg = item.get("lastMessage") or {}
+    last_text = (last_msg.get("text") or "").strip()
+    last_msg_id = str(last_msg.get("id", ""))
+    unread = item.get("unreadCount", 0)
+
+    # Check for chat lock FIRST — if locked, no reply possible regardless of sender
+    lock_reason = _check_chat_locked(item)
+    if lock_reason:
+        result["chat_locked"] = lock_reason
+        result["last_msg_id"] = last_msg_id or str(hash(last_text))
+        log_debug(f"_build_thread {neg_id}: чат заблокирован — {lock_reason!r}")
+        return result
+
+    # Sender: compare participantId with currentParticipantId
+    sender_id = str(last_msg.get("participantId") or "").strip()
+    cur_pid_norm = str(cur_pid or "").strip()
+    if not sender_id:
+        from_employer = True
+    else:
+        from_employer = bool(cur_pid_norm and sender_id != cur_pid_norm)
+
+    # Check for workflow transitions: skip only string-type workflow events (REJECTION, APPLICATION, etc.)
+    # Numeric wf.id = internal message reference, not a system event — real employer text
+    wf = last_msg.get("workflowTransition") or {}
+    wf_id = wf.get("id", "") if isinstance(wf, dict) else ""
+    is_workflow_msg = isinstance(wf_id, str) and bool(wf_id)  # only string types = system events
+
+    needs_reply = (unread > 0) and from_employer and not is_workflow_msg
+    result["needs_reply"] = needs_reply
+    result["last_msg_id"] = last_msg_id or str(hash(last_text))
+
+    if last_text:
+        sender = "employer" if from_employer else "applicant"
+        result["messages"] = [{"sender": sender, "text": last_text, "msg_id": last_msg_id}]
+        if from_employer:
+            result["last_employer_msg"] = last_text
+
+    resources = (item.get("resources") or {})
+    neg_topics = resources.get("NEGOTIATION_TOPIC", [])
+    if neg_topics:
+        result["topic_id"] = str(neg_topics[0])
+
+    return result
+
+
+def fetch_negotiation_thread(acc: dict, neg_id: str) -> dict:
+    """Fetch info for a single negotiation thread (chatId = neg_id).
+    Fetches the full paginated chat list and finds the matching entry.
+    Returns {neg_id, employer_name, vacancy_title, messages, needs_reply,
+             last_msg_id, last_employer_msg, topic_id, error}
+    """
+    result = {"neg_id": neg_id, "employer_name": "Работодатель", "vacancy_title": "",
+              "messages": [], "needs_reply": False, "last_msg_id": "", "last_employer_msg": "",
+              "topic_id": "", "error": ""}
+    try:
+        items_by_id, display_info, cur_pid = _fetch_chat_list(acc, max_pages=5)
+        item = items_by_id.get(str(neg_id))
+        if not item:
+            result["error"] = "чат не найден"
+            log_debug(f"fetch_negotiation_thread {neg_id}: not in {list(items_by_id.keys())[:5]}")
+            return result
+        return _build_thread_from_chat_item(item, display_info, cur_pid, neg_id)
+    except Exception as e:
+        result["error"] = str(e)
+        log_debug(f"fetch_negotiation_thread {neg_id}: {e}")
+    return result
+
+
+def _fetch_chat_history(acc: dict, chat_id: str, max_messages: int = 20) -> list:
+    """Fetch full message history for a specific chat via chatik/api/chat_data.
+    Returns list of {"sender": "employer"|"applicant", "text": str} dicts,
+    oldest first, skipping system/workflow messages.
+    """
+    _ensure_chatik_cookies(acc)
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    xsrf = acc["cookies"].get("_xsrf", "")
+    try:
+        r = HH.get(
+            f"{_CHATIK_BASE}/chatik/api/chat_data",
+            params={"chatId": int(chat_id)},
+            cookies=acc["cookies"],
+            headers={
+                "User-Agent": ua,
+                "Accept": "application/json",
+                "Referer": f"{_CHATIK_BASE}/",
+                "Origin": _CHATIK_BASE,
+                "X-XSRFToken": xsrf,
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log_debug(f"_fetch_chat_history {chat_id}: HTTP {r.status_code}")
+            return []
+        data = r.json()
+        cur_pid = str(data.get("chat", {}).get("currentParticipantId", ""))
+        items = data.get("chat", {}).get("messages", {}).get("items", [])
+        conversation = []
+        for msg in items:
+            # Skip non-text message types
+            if msg.get("type") not in ("SIMPLE",):
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            # Skip system workflow events (rejection, offer, etc.) — string wf.id only.
+            # Numeric wf.id = internal message reference, not a system event — keep those.
+            wf = msg.get("workflowTransition") or {}
+            wf_id = wf.get("id", "") if isinstance(wf, dict) else ""
+            if isinstance(wf_id, str) and wf_id:
+                continue
+            sender_pid = str(msg.get("participantId") or "").strip()
+            cur_pid_norm = str(cur_pid or "").strip()
+            if not sender_pid:
+                sender = "employer"
+            elif cur_pid_norm and sender_pid == cur_pid_norm:
+                sender = "applicant"
+            else:
+                sender = "employer"
+            # HH иногда возвращает participantDisplay как str → AttributeError на .get
+            # → caught broadly, ВСЯ история чата выкидывается. Защищаемся (r12-3 #5).
+            pd = msg.get("participantDisplay")
+            if not isinstance(pd, dict):
+                pd = {}
+            conversation.append({
+                "sender": sender, "text": text,
+                "msg_id": str(msg.get("id", "")),
+                "actions": msg.get("actions") or {},
+                "is_bot": pd.get("isBot", False),
+            })
+        # Return last max_messages entries (most recent context)
+        return conversation[-max_messages:]
+    except Exception as e:
+        log_debug(f"_fetch_chat_history {chat_id}: {e}")
+        return []
+
+
+def fetch_quick_replies(acc: dict, chat_id: str, msg_id: str) -> list:
+    """`GET chatik.hh.ru/chatik/api/quick_replies?chatId&messageId` —
+    HH сам генерит 2-4 варианта готовых ответов на конкретное сообщение HR
+    (доменно-специфичной моделью, с контекстом всей переписки).
+    Возвращает список строк или пустой список при отказе / отсутствии.
+    """
+    if not chat_id or not msg_id:
+        return []
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    try:
+        r = HH.get(
+            f"{_CHATIK_BASE}/chatik/api/quick_replies",
+            params={"chatId": str(chat_id), "messageId": str(msg_id)},
+            cookies=acc.get("cookies") or {},
+            headers={
+                "User-Agent": ua,
+                "Accept": "application/json",
+                "Origin": _CHATIK_BASE,
+                "Referer": f"{_CHATIK_BASE}/",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        # Формат: {"quick_replies": [{"text": "..."}]}, {"items": [...]} либо просто [...]
+        if isinstance(data, dict):
+            replies = data.get("quick_replies") or data.get("items") or []
+        else:
+            replies = data
+        if not isinstance(replies, list):
+            return []
+        out = []
+        for item in replies:
+            if isinstance(item, str):
+                out.append(item.strip())
+            elif isinstance(item, dict):
+                t = (item.get("text") or item.get("value") or "").strip()
+                if t:
+                    out.append(t)
+        return out
+    except Exception as e:
+        log_debug(f"fetch_quick_replies chat={chat_id} msg={msg_id}: {e}")
+        return []
+
+
+def send_participant_action(acc: dict, chat_id: str, action_type: str = "TYPING") -> bool:
+    """`POST /chatik/api/participant_action {chatId, actionType}` — эмуляция
+    typing indicator. `TYPING` показывает HR что мы печатаем; `NONE` снимает.
+    """
+    if not chat_id:
+        return False
+    _ensure_chatik_cookies(acc)
+    xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0"
+    try:
+        r = HH.post(
+            f"{_CHATIK_BASE}/chatik/api/participant_action",
+            cookies=acc.get("cookies", {}),
+            headers={
+                "User-Agent": ua, "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": _CHATIK_BASE, "Referer": f"{_CHATIK_BASE}/",
+                "X-XSRFToken": xsrf,
+            },
+            json={"chatId": int(chat_id) if str(chat_id).isdigit() else chat_id,
+                  "actionType": action_type},
+            timeout=8,
+        )
+        if r.status_code == 409:
+            # Ожидаемо: HH возвращает 409 если для этого чата typing неприменим
+            # (нет unread от собеседника / последнее сообщение наше). Не warn'аем.
+            return False
+        if r.status_code not in (200, 204):
+            log_debug(f"send_participant_action chat={chat_id} action={action_type}: HTTP {r.status_code}")
+        return r.status_code in (200, 204)
+    except Exception as e:
+        log_debug(f"send_participant_action chat={chat_id}: {e}")
+        return False
+
+
+def mark_chat_read(acc: dict, chat_id: str, message_id: str) -> bool:
+    """`POST /chatik/api/mark_read` — помечает сообщение прочитанным.
+    HR видит галочку — часто триггер для follow-up с их стороны.
+    Пропускаем если messageId не число — это hash-fallback из _build_thread_from_chat_item
+    для сообщений без реального id (HH такой messageId вернёт 400/422).
+    """
+    if not chat_id or not message_id:
+        return False
+    if not str(message_id).lstrip("-").isdigit():
+        return False
+    _ensure_chatik_cookies(acc)
+    xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0"
+    try:
+        r = HH.post(
+            f"{_CHATIK_BASE}/chatik/api/mark_read",
+            cookies=acc.get("cookies", {}),
+            headers={
+                "User-Agent": ua, "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": _CHATIK_BASE, "Referer": f"{_CHATIK_BASE}/",
+                "X-XSRFToken": xsrf,
+            },
+            json={
+                "chatId": int(chat_id) if str(chat_id).isdigit() else chat_id,
+                "messageId": str(message_id),
+                "hasUnreadDiscardMessage": False,
+                "hasUnseenLocationInconsistencyBotMessage": False,
+            },
+            timeout=8,
+        )
+        if r.status_code not in (200, 204):
+            log_debug(f"mark_chat_read chat={chat_id} msg={message_id}: HTTP {r.status_code}")
+        return r.status_code in (200, 204)
+    except Exception as e:
+        log_debug(f"mark_chat_read chat={chat_id}: {e}")
+        return False
+
+
+def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = "") -> bool:
+    """Send a message in an HH negotiation thread.
+
+    Если CONFIG.chat_use_oauth — сначала пробуем ОФИЦИАЛЬНЫЙ путь
+    `POST api.hh.ru/common/chats/{chat_id}/messages` через OAuth Bearer.
+    Это ToS-compliant и помечает сообщение `is_automated: true`.
+    На любую ошибку OAuth (нет токена/403/network) — fallback на
+    reverse-engineered chatik.hh.ru/chatik/api/send (старый working путь).
+    """
+    import uuid as _uuid
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    # OAuth-first path. Degraded mode forces OAuth (cookies dead).
+    try:
+        from app.config import CONFIG as _CFG
+        # Cookies-expired detect: если в acc нет hhtoken — chatik всё равно не пойдёт.
+        _cookies_dead = not (acc.get("cookies", {}) or {}).get("hhtoken")
+        if getattr(_CFG, "chat_use_oauth", False) or _cookies_dead:
+            # 1) /negotiations/{neg_id}/messages — cleanest endpoint, neg_id известен напрямую
+            try:
+                from app.oauth import send_negotiation_message_oauth as _oauth_neg_send
+                if _oauth_neg_send(acc, neg_id, text):
+                    return True
+                log_debug(f"OAuth /negotiations send neg={neg_id} → False, пробую /common/chats")
+            except Exception as _e:
+                log_debug(f"OAuth /negotiations send neg={neg_id} exception: {_e}")
+            # 2) /common/chats/{chat_id}/messages — fallback (предполагает chat_id == neg_id)
+            try:
+                from app.oauth import send_chat_message_oauth as _oauth_send
+                _r = _oauth_send(acc, neg_id, text, is_automated=True)
+                if _r is True:
+                    return True
+                if _r == "chat_not_found":
+                    return "chat_not_found"
+                if _r == "no_token":
+                    log_debug(f"OAuth chat send neg={neg_id}: нет токена, fallback на chatik")
+                else:
+                    log_debug(f"OAuth chat send neg={neg_id}: result={_r!r}, fallback на chatik")
+            except Exception as _e:
+                log_debug(f"OAuth chat send neg={neg_id} exception: {_e}, fallback на chatik")
+    except Exception:
+        pass
+
+    # Ensure we have chatik auth cookies (hhuid/crypted_hhuid)
+    _ensure_chatik_cookies(acc)
+    xsrf = acc["cookies"].get("_xsrf", "")
+
+    try:
+        resp = HH.post(
+            f"{_CHATIK_BASE}/chatik/api/send",
+            cookies=acc["cookies"],
+            headers={
+                "User-Agent": ua,
+                "Accept": "application/json, */*",
+                "Content-Type": "application/json",
+                "Referer": f"{_CHATIK_BASE}/",
+                "Origin": _CHATIK_BASE,
+                "X-XSRFToken": xsrf,
+            },
+            json={"chatId": int(str(neg_id).strip()), "idempotencyKey": str(_uuid.uuid4()), "text": text},
+            timeout=15,
+        )
+        log_debug(f"send via chatik/api/send {neg_id}: HTTP {resp.status_code} | {resp.text[:300]}")
+        if resp.status_code in (200, 201, 204):
+            return True
+        if resp.status_code == 409:
+            try:
+                body_json = resp.json()
+            except Exception:
+                body_json = {}
+            # Новый формат HH: {"error":[{"key":"CHAT_DOES_NOT_EXIST","description":"..."}],"code":409}
+            # Старый формат: {"error":"chat_not_found","message":"..."}
+            err_field = body_json.get("error") or body_json.get("type") or ""
+            err_keys = []
+            if isinstance(err_field, list):
+                for e in err_field:
+                    if isinstance(e, dict):
+                        err_keys.append(str(e.get("key", "")).lower())
+                        err_keys.append(str(e.get("description", "")).lower())
+            else:
+                err_keys.append(str(err_field).lower())
+            err_msg = str(body_json.get("message") or body_json.get("description") or "").lower()
+            err_keys.append(err_msg)
+            full_text = (resp.text or "").lower()
+            err_keys.append(full_text)
+            joined = " ".join(err_keys)
+            # Closed/archived/non-existent chat → chat_not_found
+            CHAT_GONE_MARKERS = (
+                "chat_not_found", "chat_does_not_exist", "chat does not exist",
+                "archived", "closed", "not_found", "not found",
+            )
+            if any(m in joined for m in CHAT_GONE_MARKERS):
+                return "chat_not_found"
+            if "duplicate" in joined or "rate" in joined:
+                return False
+            return False
+        return False
+    except Exception as e:
+        log_debug(f"send_negotiation_message {neg_id} error: {e}")
+        return False
+
+
+# ── Chatik WebSocket push-канал ────────────────────────────────────────
+# Reverse-engineered: chatik фронт подключается к wss://websocket.hh.ru/ws/connect
+# через iframe-proxy. На WS приходят push-события chat_message_create,
+# chat_state_changed и т.д. Это даёт мгновенный триггер LLM-ответа вместо
+# 5-минутного polling-цикла.
+#
+# Протокол (из chunk 220 chatik-фронта):
+#   1) GET https://websocket.hh.ru/connection/data?connectionMode=direct&appVersion=X
+#      с HH-куками → {"url": "wss://websocket.hh.ru/ws/connect?sd=<auth>"}
+#   2) WebSocket(url) — auth вшит в sd= токен, отдельной подписки не нужно
+#   3) Сервер шлёт JSON {type/event: "chat_message_create", ...}
+#   4) Ping каждые 180с (как в HH-фронте), reconnect через 2с до 120 попыток
+
+_WS_BASE = "https://websocket.hh.ru"
+_WS_APP_VERSION = "1.9.45"
+_WS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+_KNOWN_WS_EVENTS = {
+    "connect", "disconnect",
+    "chat_message_create", "chat_message_deleted", "chat_message_edited",
+    "chat_state_changed", "last_viewed_message_change", "chat_participant_action",
+}
+
+
+def fetch_chatik_ws_url(acc: dict) -> str | None:
+    """Получить персональный wss-URL для аккаунта. Возвращает None при ошибке."""
+    _ensure_chatik_cookies(acc)
+    try:
+        r = HH.get(
+            f"{_WS_BASE}/connection/data",
+            params={"connectionMode": "direct", "appVersion": _WS_APP_VERSION},
+            cookies=acc.get("cookies") or {},
+            headers={
+                "User-Agent": _WS_UA,
+                "Accept": "application/json, text/plain, */*",
+                "Origin": _WS_BASE,
+                "Referer": f"{_WS_BASE}/proxy-webapp/index.html",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log_debug(f"fetch_chatik_ws_url: HTTP {r.status_code} | {r.text[:200]}")
+            return None
+        url = (r.json() or {}).get("url", "").strip()
+        if not url.startswith("wss://websocket.hh."):
+            log_debug(f"fetch_chatik_ws_url: подозрительный URL {url[:80]!r} — отбрасываем")
+            return None
+        return url
+    except Exception as e:
+        log_debug(f"fetch_chatik_ws_url: {e}")
+        return None
+
+
+class ChatikWSClient:
+    """Per-account длинный WS к websocket.hh.ru.
+
+    Колбэк on_event(event_name, payload_dict) вызывается на каждое распарсенное
+    JSON-сообщение. Клиент сам реконнектится с экспоненциальным backoff'ом
+    (как HH-фронт: до 120 попыток с шагом 2с), пингует pong/ping каждые 180с.
+    """
+    def __init__(self, acc: dict, on_event, label: str = ""):
+        self.acc = acc
+        self.on_event = on_event
+        self.label = label or (acc.get("name") or "?")
+        import threading as _t
+        self._stop_evt = _t.Event()
+        self._thread = None
+        self._ws = None
+        self._attempts = 0
+        self._lock = _t.Lock()
+
+    def start(self):
+        import threading as _t
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_evt.clear()
+            self._attempts = 0
+            self._thread = _t.Thread(target=self._run, daemon=True, name=f"chatik-ws-{self.label}")
+            self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+
+    @property
+    def alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive() and not self._stop_evt.is_set())
+
+    def _run(self):
+        try:
+            import websocket as _ws_mod
+        except ImportError:
+            log_debug(f"chatik WS [{self.label}]: websocket-client не установлен — push выключен")
+            return
+        while not self._stop_evt.is_set():
+            url = fetch_chatik_ws_url(self.acc)
+            if not url:
+                # Куки протухли или сеть — ждём 30с и пробуем снова
+                if self._stop_evt.wait(30):
+                    return
+                continue
+            cookie_str = ";".join(f"{k}={v}" for k, v in (self.acc.get("cookies") or {}).items())
+            self._ws = _ws_mod.WebSocketApp(
+                url,
+                on_open=lambda w: self._on_open(),
+                on_message=lambda w, m: self._on_message(m),
+                on_error=lambda w, e: log_debug(f"chatik WS [{self.label}] err: {e}"),
+                on_close=lambda w, c, r: log_debug(f"chatik WS [{self.label}] closed code={c}"),
+                cookie=cookie_str,
+                header={"User-Agent": _WS_UA, "Origin": _WS_BASE},
+            )
+            try:
+                self._ws.run_forever(ping_interval=180, ping_timeout=20, skip_utf8_validation=True)
+            except Exception as e:
+                log_debug(f"chatik WS [{self.label}] run_forever err: {e}")
+            if self._stop_evt.is_set():
+                return
+            self._attempts += 1
+            if self._attempts > 120:
+                log_debug(f"chatik WS [{self.label}]: max attempts reached — стоп")
+                return
+            # backoff 2с + 0.5с/попытка, потолок 30с (как у HH-фронта)
+            delay = min(2 + self._attempts * 0.5, 30)
+            if self._stop_evt.wait(delay):
+                return
+
+    def _on_open(self):
+        log_debug(f"chatik WS [{self.label}]: OPEN (attempt={self._attempts})")
+        self._attempts = 0
+        try:
+            self.on_event("connect", {})
+        except Exception as e:
+            log_debug(f"chatik WS [{self.label}] on_event(connect) err: {e}")
+
+    def _on_message(self, raw):
+        try:
+            msg = __import__("json").loads(raw)
+        except Exception:
+            log_debug(f"chatik WS [{self.label}]: non-JSON {raw[:100]!r}")
+            return
+        # HH-фронт читает s.I.on(name, handler); name — это либо msg.type, либо msg.event.
+        event = (msg.get("type") if isinstance(msg, dict) else None) or msg.get("event") or ""
+        if not event:
+            # Иногда событие приходит как {<event_name>: {...}} — берём первый ключ.
+            for k in (msg if isinstance(msg, dict) else {}):
+                if k in _KNOWN_WS_EVENTS:
+                    event = k
+                    break
+        if not event:
+            log_debug(f"chatik WS [{self.label}]: неизвестный формат {str(msg)[:200]!r}")
+            return
+        try:
+            self.on_event(event, msg if isinstance(msg, dict) else {})
+        except Exception as e:
+            log_debug(f"chatik WS [{self.label}] on_event({event}) err: {e}")
+
+
+def _mark_chat_read(acc: dict, chat_id: str, message_id: str):
+    """Mark a chatik chat as read up to the given message ID."""
+    try:
+        cid = int(str(chat_id).strip())
+        mid = int(str(message_id).strip())
+    except (ValueError, TypeError):
+        return
+    _ensure_chatik_cookies(acc)
+    xsrf = acc.get("cookies", {}).get("_xsrf", "")
+    try:
+        HH.post(
+            f"{_CHATIK_BASE}/chatik/api/mark_read",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                     "Accept": "application/json", "Content-Type": "application/json",
+                     "Origin": _CHATIK_BASE, "Referer": f"{_CHATIK_BASE}/",
+                     "X-XSRFToken": xsrf},
+            cookies=acc["cookies"],
+            json={"chatId": cid, "messageId": mid},
+            timeout=5
+        )
+    except Exception as e:
+        log_debug(f"_mark_chat_read {cid}: {e}")
