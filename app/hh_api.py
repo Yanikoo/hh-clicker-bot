@@ -37,13 +37,6 @@ def parse_search_page(html: str) -> dict:
         log_debug(f"parse_search_page: BeautifulSoup failed: {e}")
         return {"ids": set(), "meta": {}, "salaries": {}, "schedules": {}}
 
-    # ---- IDs ---------------------------------------------------------------
-    ids = set()
-    for link in soup.find_all("a", href=re.compile(r"/vacancy/\d+")):
-        m = re.search(r"/vacancy/(\d+)", link["href"])
-        if m:
-            ids.add(m.group(1))
-
     # ---- Meta --------------------------------------------------------------
     meta = {}
     for item in soup.find_all(attrs={"data-qa": re.compile(r"vacancy-serp__vacancy$")}):
@@ -80,6 +73,12 @@ def parse_search_page(html: str) -> dict:
             title = link.get_text(strip=True)
             if title and len(title) > 4:
                 meta[vid] = {"title": title, "company": ""}
+
+    # На реальной search-странице есть дополнительные /vacancy/... ссылки:
+    # рекомендации, история просмотров и рекламные блоки. Берём только ID тех
+    # карточек, для которых удалось получить заголовок. Link-only fallback
+    # оставлен для упрощённой/legacy разметки.
+    ids = set(meta) if meta else set()
 
     # ---- Salaries ----------------------------------------------------------
     salaries = {}

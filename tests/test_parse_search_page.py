@@ -41,6 +41,19 @@ def test_html_with_two_vacancies_returns_two_ids(monkeypatch):
     assert result["ids"] == {"11111", "22222"}
 
 
+def test_real_search_cards_ignore_unrelated_vacancy_links(monkeypatch):
+    _reset_cache(monkeypatch)
+    html = """
+    <div data-qa="vacancy-serp__vacancy">
+        <a data-qa="serp-item__title" href="/vacancy/11111">PHP Laravel Developer</a>
+    </div>
+    <aside><a href="/vacancy/99999">Электрик</a></aside>
+    """
+    result = parse_search_page(html)
+    assert result["ids"] == {"11111"}
+    assert "99999" not in result["meta"]
+
+
 def test_identity_cache_single_beautifulsoup_call(monkeypatch):
     import app.hh_api as hh_api
     from bs4 import BeautifulSoup

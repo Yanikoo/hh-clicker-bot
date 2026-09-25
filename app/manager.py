@@ -12,6 +12,7 @@ from pathlib import Path
 import time
 import threading
 import requests
+import re
 from app.hh_http import HH
 try:
     from zoneinfo import ZoneInfo
@@ -109,22 +110,51 @@ from app.state import AccountState
 
 LLM_LOG_FILE = Path("data") / "llm_log.jsonl"
 
+# Общий cooldown для поисковых запросов. HH отвечает 429, когда страниц
+# запрашивается слишком много; без общей паузы остальные coroutine продолжали
+# отправлять запросы и только продлевали ограничение.
+_collect_rate_limit_until = 0.0
+
 # -- Async page fetcher (used only by BotManager) --
 
 async def fetch_page(session, url, sem):
-    async with sem:
-        try:
-            await asyncio.sleep(0.05)
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                html = await r.text()
-                # Логируем только не-200 и аномальные размеры — иначе hundreds
-                # of disk writes per cycle давят RotatingFileHandler (swarm-16 #9).
-                if r.status != 200 or len(html) < 1000:
-                    log_debug(f"⚠️ URL: {url} | Статус: {r.status} | Размер: {len(html)}")
-                return html
-        except Exception as e:
-            log_debug(f"❌ ОШИБКА при загрузке: {url} | {type(e).__name__}: {e}")
-            return ""
+    global _collect_rate_limit_until
+    for attempt in range(2):
+        async with sem:
+            try:
+                cooldown = _collect_rate_limit_until - time.time()
+                if cooldown > 0:
+                    await asyncio.sleep(cooldown)
+                # Небольшой интервал не даёт трём worker'ам ударить в HH строго
+                # в одну миллисекунду.
+                await asyncio.sleep(1.0)
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    html = await r.text()
+                    if r.status == 429:
+                        try:
+                            retry_after = int(r.headers.get("Retry-After", "60"))
+                        except (TypeError, ValueError):
+                            retry_after = 60
+                        retry_after = min(max(retry_after, 30), 300)
+                        _collect_rate_limit_until = max(
+                            _collect_rate_limit_until, time.time() + retry_after
+                        )
+                        log_debug(
+                            f"⏳ HH 429: общая пауза поиска {retry_after}с | {url}"
+                        )
+                        continue
+                    # Логируем только не-200 и аномальные размеры — иначе hundreds
+                    # of disk writes per cycle давят RotatingFileHandler.
+                    if r.status != 200 or len(html) < 1000:
+                        log_debug(f"⚠️ URL: {url} | Статус: {r.status} | Размер: {len(html)}")
+                    return html if r.status == 200 else ""
+            except Exception as e:
+                log_debug(f"❌ ОШИБКА при загрузке: {url} | {type(e).__name__}: {e}")
+                if attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+                return ""
+    return ""
 
 
 # ============================================================
@@ -179,6 +209,33 @@ def _employer_message_requires_reply(text: str) -> bool:
         "удобно", "предлагаем", "давайте", "пришлите", "отправьте",
     )
     return any(marker in normalized for marker in request_markers)
+
+
+def _title_has_keyword(title: str, keyword: str) -> bool:
+    r"""Match a title keyword as a term, not as an arbitrary substring.
+
+    In particular, stop-word ``java`` must not reject ``javascript``.
+    Unicode ``\w`` also gives correct boundaries for Russian words.
+    """
+    normalized_title = " ".join(str(title or "").lower().split())
+    normalized_keyword = " ".join(str(keyword or "").lower().split())
+    if not normalized_title or not normalized_keyword:
+        return False
+    left = r"(?<!\w)" if normalized_keyword[0].isalnum() else ""
+    right = r"(?!\w)" if normalized_keyword[-1].isalnum() else ""
+    return re.search(left + re.escape(normalized_keyword) + right, normalized_title) is not None
+
+
+def _title_matches_job_filter(title: str, include: list[str], exclude: list[str]) -> bool:
+    """Fail closed: an unknown or unrelated vacancy title is never eligible."""
+    normalized_title = " ".join(str(title or "").lower().split())
+    if not normalized_title:
+        return False
+    if include and not any(_title_has_keyword(normalized_title, k) for k in include):
+        return False
+    if exclude and any(_title_has_keyword(normalized_title, k) for k in exclude):
+        return False
+    return True
 
 
 class BotManager:
@@ -1399,14 +1456,15 @@ class BotManager:
             discard_skipped = 0
             for vid in unique_vacancies:
                 meta = state.vacancy_meta.get(vid, {})
-                title = (meta.get("title") or "").lower()
-                if title:
-                    if title_include_keywords and not any(k in title for k in title_include_keywords):
-                        title_skipped += 1
-                        continue
-                    if title_exclude_keywords and any(k in title for k in title_exclude_keywords):
-                        title_skipped += 1
-                        continue
+                title = meta.get("title") or ""
+                # Без надёжно распознанного заголовка отклик запрещён. Раньше
+                # пустой title обходил оба списка и пропускал случайные ссылки
+                # со страницы поиска (повар, электрик и т.п.).
+                if not _title_matches_job_filter(
+                    title, title_include_keywords, title_exclude_keywords
+                ):
+                    title_skipped += 1
+                    continue
                 # HH сам метит вакансии меткой DISCARD когда нас уже отвергли —
                 # повторный отклик чаще всего бесполезен, экономим лимит/токены.
                 hh_labels = meta.get("hh_labels") or []
@@ -2164,12 +2222,15 @@ class BotManager:
         if not xsrf:
             return {}, {}, {}
         headers = get_headers(xsrf)
-        sem = asyncio.Semaphore(CONFIG.max_concurrent * 3)
+        # max_concurrent должен означать реальное число одновременных запросов.
+        # Раньше значение ошибочно умножалось на 3 (20 в UI превращалось в 60).
+        concurrency = max(1, min(int(CONFIG.max_concurrent), 10))
+        sem = asyncio.Semaphore(concurrency)
 
         # enable_cleanup_closed=True — закрывает половинно-закрытые TCP keep-alive
         # подключения (HH иногда дропает их), иначе fetch падает с ServerDisconnectedError.
         connector = aiohttp.TCPConnector(
-            limit=CONFIG.max_concurrent * 3,
+            limit=concurrency,
             enable_cleanup_closed=True,
         )
 
